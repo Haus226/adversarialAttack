@@ -1,7 +1,14 @@
 import tqdm
 import torch
-from datetime import datetime
-import json
+import json, os
+from piq.ssim import ssim 
+from piq.fsim import fsim
+from piq.psnr import psnr
+from piq.vif import vif_p
+from piq.ms_ssim import multi_scale_ssim
+from piq.iw_ssim import information_weighted_ssim
+from piq.mdsi import mdsi
+from prettytable import PrettyTable
 
 def calculate_accuracy(model, data_loader):
         model = model.to("cuda")
@@ -27,14 +34,19 @@ def calculate_accuracy(model, data_loader):
         accuracy = 100 * correct / total
         return accuracy, correct_classification
 
-def attack_metadata(batch_size, alpha, eps, n_iter,
-                    mi_fgsm=None, ni_fgsm=None, agi_fgsm=None,
-                    rmsi_fgsm=None, ai_fgsm=None, nai_fgsm=None,
+def attack_metadata(save_dir, time, amp, batch_size, alpha, eps, n_iter, act, num_fig,
+                    performed_attck, targeted,
+                    mi_fgsm=None, ni_fgsm=None, agi_fgsm=None, adi_fgsm=None,
+                    rmsi_fgsm=None, ai_fgsm=None, ani_fgsm=None, nai_fgsm=None,
+                    yogi_fgsm=None, adai_fgsm=None, abi_fgsm=None,
                     dim=None, tim=None, admix=None, vt=None):
-    time = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
     metadata = {
-        "time":time,
-        "hyperparameter":{"batch_size":batch_size, "alpha":alpha, "eps":eps, "n_iter":n_iter},
+        "Time":time,
+        "Enable_amp":amp,
+        "Hyperparameters":{"batch_size":batch_size, "alpha":alpha, "eps":eps, "n_iter":n_iter,
+                        "activation":act, "num_figure":num_fig},
+        "Attack":performed_attck,
+        "Targeted":targeted,
         "DIM":dim,
         "TIM":tim,
         "ADMIX":admix,
@@ -42,12 +54,69 @@ def attack_metadata(batch_size, alpha, eps, n_iter,
         "MI-FGSM":mi_fgsm,
         "NI-FGSN":ni_fgsm,
         "AGI-FGSM":agi_fgsm,
+        "ADI-FGSM":adi_fgsm,
         "RMSI-FGSM":rmsi_fgsm,
         "AI-FGSM":ai_fgsm,
+        "ANI-FGSM":ani_fgsm,
         "NAI-FGSM":nai_fgsm,
+        "YOGI":yogi_fgsm, 
+        "ADAI":adai_fgsm,
+        "ADABELIEF":abi_fgsm,
     }
-    with open(f'{time}.json', 'w') as file:
+    time = time.replace("/", "_")
+    time = time.replace(":", "_")
+    with open(f'{save_dir}/metadata.json', 'w') as file:
         json.dump(metadata, file, indent=4)
+    print(metadata["Hyperparameters"], metadata["Targeted"])
+    return json.dumps(metadata, indent=4)
+
+def compute_metrics(img, adv_img, verbose=False):
+    '''
+    return: ssim, psnr, fsim, iw-ssim, ms-ssim, mdsi, vifp, mse, mae
+    '''
+    _ssim = ssim(img, adv_img, data_range=1.0).item()
+    _psnr = psnr(img, adv_img, data_range=1.0).item()
+    _fsim = fsim(img, adv_img, data_range=1.0).item()
+    _iw_ssim = information_weighted_ssim(img, adv_img, data_range=1.0).item()
+    _ms_ssim = multi_scale_ssim(img, adv_img, data_range=1.0).item()
+    _mdsi = mdsi(img, adv_img, data_range=1.0).item()
+    _vifp = vif_p(img, adv_img, data_range=1.0).item()
+    _mse = float(torch.mean((img - adv_img) ** 2).cpu())
+    _mae = float(torch.mean(torch.abs(img - adv_img)).cpu())
+    if verbose: 
+        print(f'SSIM: {_ssim}')
+        print(f'PSNR: {_psnr}')
+        print(f'FSIM: {_fsim}')
+        print(f'IW-SSIM: {_iw_ssim}')
+        print(f'MS-SSIM: {_ms_ssim}')
+        print(f'MDSI: {_mdsi}')
+        print(f'VIFp: {_vifp}')
+        print(f'MSE: {_mse}')
+        print(f'MAE: {_mae}')
+    return [_ssim, _psnr, _fsim, _iw_ssim, _ms_ssim, _mdsi, _vifp, _mse, _mae]
+
+def display_result(m, att, targeted, metrics, metrics_average):
+    t = PrettyTable(["ITEM", "VALUE"])
+    t.add_row(['METHOD', f"{m}_{att}"])
+    t.add_row(["TARGETED", targeted])
+    for idx in range(len(metrics)):
+        t.add_row([metrics[idx], metrics_average[idx]])
+    print(t)      
+
+def read_metadata(dir):
+    files = os.listdir(dir)    
+    json_file = None
+    for file in files:
+        if file.endswith('.json'):
+            json_file = file
+            break    
+    if json_file is None:
+        raise FileNotFoundError("No metadata JSON file found in the directory")    
+    json_path = os.path.join(dir, json_file)
+    with open(json_path, 'r') as f:
+        metadata = json.load(f)
+    return metadata
+
 
 if __name__ == "__main__":
     from attack import MI_FGSM, NI_FGSM, AGI_FGSM, RMSI_FGSM, AI_FGSM, NAI_FGSM

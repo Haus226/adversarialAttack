@@ -1,146 +1,15 @@
-import random
-from torch import nn
+from torch import nn, optim
 import torch
-import torch.nn.functional as F
-import numpy as np
 from abc import ABC, abstractmethod
+from activation import *
+from misc import *
+import math
 
-class Dummy:
-    '''
-    Creating a dummy class to maintain consistency in function or method calls 
-    when certain classes are None, useful in simplifying code logic
-    '''
-    def __init__(self):
-        pass
-    
-    def forward(self, x):
-        return x
-    
-class DI:
-    def __init__(self, low, high, p:float=0.5) -> None:
-        self.low = low
-        self.high = high
-        self.p = p
-
-    def forward(self, x):
-        # Random resize
-        rnd = torch.randint(low=self.low, high=self.high, size=(1, ))
-        rescaled = F.interpolate(x, size=(rnd, rnd), mode='nearest')
-        
-        # Calculate padding
-        h_rem = self.high - rnd
-        w_rem = self.high - rnd
-        pad_top = random.randint(0, h_rem)
-        pad_bottom = h_rem - pad_top
-        pad_left = random.randint(0, w_rem)
-        pad_right = w_rem - pad_left
-        
-        # Apply padding
-        padded = F.pad(rescaled, (pad_left, pad_right, pad_top, pad_bottom), value=0)
-        # Ensure the padded tensor has the correct shape
-        padded = padded.view(x.size(0), self.high, self.high, 3).permute(0, 3, 1, 2)
-        return padded if random.random() < self.p else x
-    
-class TI:
-    def __init__(self, 
-                kernel_size, 
-                nsig,
-                device="cuda"
-                ) -> None:
-        import scipy.stats as st
-        kern1d = st.norm.pdf(np.linspace(-nsig, nsig, kernel_size))
-        kernel_raw = np.outer(kern1d, kern1d)
-        kernel = kernel_raw / kernel_raw.sum()
-
-        stack_kernel = np.stack([kernel, kernel, kernel])
-        stack_kernel = np.expand_dims(stack_kernel, 1)
-        self.kernel = torch.from_numpy(stack_kernel).float().to(device)
-        
-    def forward(self, grad, device="cuda"):
-        return F.conv2d(grad, self.kernel, stride=1, padding="same", groups=3)
-
-class Admix:
-    '''
-    Paper : Admix: Enhancing the Transferability of Adversarial Attacks
-    '''
-    def __init__(self, 
-                gamma=[1 / (2 ** i) for i in range(5)], 
-                eta=0.2, 
-                num_samples=3
-                ) -> None:
-        self.eta = eta
-        self.gamma = gamma
-        self.num_samples = num_samples
-        if not isinstance(self.gamma, list):
-                self.m = 1
-        else:
-            self.m = len(self.gamma)
-    
-    def forward(self, x):
-        batch_size = x.size(0)
-        idxs = torch.arange(batch_size)
-        x_admix = []
-        for _ in range(self.num_samples):
-            shuffled_idxs = idxs[torch.randperm(batch_size)]
-            slave = x[shuffled_idxs]
-            x_admix.append(x + self.eta * slave)
-        x_admix = torch.cat(x_admix, dim=0)
-        return torch.cat([x_admix * gamma for gamma in self.gamma], dim=0)
-
-class VT:
-    '''
-    Paper : "Enhancing the Transferability of Adversarial Attacks through Variance Tuning"
-    '''
-    def __init__(self, 
-                num_samples,
-                 bound,
-                admix=None, 
-                dim=None,
-                enhanced=True
-                ) -> None:
-        self.num_samples = num_samples
-        self.bound = bound
-        self.dim = dim
-        self.admix = admix
-
-        # Paper : "Boosting Adversarial Transferability through Enhanced Momentum"
-        self.g = 1
-        self.enhanced = enhanced
-        if not isinstance(admix, Dummy):
-            self.m = self.admix.m
-            self.n = self.admix.num_samples
-            self.gamma = self.admix.gamma
-
-    def forward(self, x, model, 
-                labels, 
-                target_labels=None,
-                device="cuda"
-               ):
-        noise = torch.zeros_like(x).detach().to(device)
-        for _ in range(self.num_samples):
-            x_neighbor = x + torch.randn_like(x).to(device) * self.bound.to(device) * self.g
-            x_neighbor = self.admix.forward(x_neighbor)
-            x_neighbor.retain_grad()
-            loss = nn.CrossEntropyLoss()
-            outputs = model(self.dim.forward(x_neighbor))
-            if target_labels is not None:
-                l = -loss(outputs, target_labels)
-            else:
-                l = loss(outputs, labels)
-            grad = torch.autograd.grad(
-                    l, x_neighbor, retain_graph=False, create_graph=False
-                )[0]
-            if isinstance(self.admix, Admix):
-                grad = torch.sum(grad, dim=0) / (self.m * self.n)
-#             if not isinstance(self.admix, Dummy):
-#                 grad = torch.chunk(grad, self.m)
-#                 weights = self.gamma
-#                 weighted_noise = [g * w for g, w in zip(grad, weights)]
-#                 grad = torch.mean(torch.stack(weighted_noise), dim=0)
-#                 grad = torch.sum(torch.stack(torch.chunk(torch.Tensor(grad), self.n), dim=0), dim=0)
-            noise += grad
-            self.g = noise / self.num_samples if self.enhanced else 1
-        return noise
+# TODO: 
+# Weight decay, dcouple?
+# Adanorm ?
+# Adam debias ?
+# Gradient Centralization ?
 
 class Attack(ABC):
     def __init__(self, 
@@ -149,6 +18,7 @@ class Attack(ABC):
                 adjustment=None,
                 n_iter=10,
                 device="cuda",
+                activation:str="sign",
                 dim=None,
                 tim=None,
                 admix=None,
@@ -160,9 +30,14 @@ class Attack(ABC):
         self.ad_eps = eps * torch.tensor(adjustment, device=device).view(1, 3, 1, 1)
         self.n_iter = n_iter
         self.device = device
+        self.perturbation = None
         self.dim = DI(**dim) if dim is not None else Dummy()
         self.tim = TI(**tim) if tim is not None else Dummy()
         self.admix = Dummy()
+        if activation not in ACTIVATION:
+            raise NotImplementedError(f"Please implement {activation} function in activation.py")
+        self.activation_name = activation
+        self.activation = ACTIVATION[activation]
         self.vt = None
         if admix is not None:
             self.admix = Admix(**admix)
@@ -170,32 +45,21 @@ class Attack(ABC):
             self.n = self.admix.num_samples
             self.gamma = self.admix.gamma
         if vt is not None:
-            self.vt = VT(vt["num_samples"], (self.ad_eps * vt["bound"]).view(1, 3, 1, 1).to(device), admix=self.admix, dim=self.dim, enhanced=vt["enhanced"])
+            self.vt = VT(vt["num_samples"], (self.ad_eps * vt["bound"]).view(1, 3, 1, 1).to(device), 
+                        admix=self.admix, dim=self.dim, enhanced=vt["enhanced"])
             self.N = self.vt.num_samples
         self.grad = None
 
     @abstractmethod
     def init_components(self):
         pass
-
-    @abstractmethod
-    def get_hp(self):
-        pass
     
     def nesterov(self, adv, images):
-        '''
-        For applying nesterov accelerated gradient
-        '''
         return adv
 
     def forward(self, model, images, labels, target_labels=None):
         
-        if images.size(0) == 1:
-            early_stop = True
-        else:
-            early_stop = False
-        
-        # Ensure the images have gradients enabled
+        early_stop = True if images.size(0) else False        
         labels_ = labels.to(self.device) if isinstance(self.admix, Dummy) else labels.repeat(self.m * self.n).to(self.device)
         images = images.to(self.device)
         if target_labels is not None:
@@ -203,127 +67,133 @@ class Attack(ABC):
         else:
             target_labels_ = None
         loss = nn.CrossEntropyLoss()
-        v = torch.zeros_like(images).to(self.device)
+        self.perturbation = torch.zeros_like(images).to(self.device)
 
-        # Initialize the componenets for different subclasses
         self.init_components(images)
-
         adv = images.detach().clone().to(self.device)
         for idx in range(self.n_iter):
+            adv.requires_grad = True
+
             # Initialize NAG
             adv_nes = self.nesterov(adv, images)
-            adv_nes.requires_grad = True
-            
-            adv_ = self.admix.forward(adv_nes)
-            adv__ = self.dim.forward(adv_)
-            outputs = model(adv__)
+            outputs = model(adv_nes)
+
+            l = -loss(outputs, target_labels_) if target_labels is not None else loss(outputs, labels_)
             if early_stop:
                 if (target_labels is not None and outputs.max(1)[1] == target_labels_) or (target_labels is None and outputs.max(1)[1] != labels_):
-                    return adv_nes.detach(), outputs.max(1)[1], idx + 1
-            l = loss(outputs, target_labels_) if target_labels is not None else loss(outputs, labels_)
+                    return adv_nes.detach(), outputs.max(1)[1], l.detach().item(), self.perturbation.detach(), idx + 1
             noise = torch.autograd.grad(
-                l, adv_, retain_graph=False, create_graph=False
+                l, adv, retain_graph=False, create_graph=False
             )[0]
-            if isinstance(self.admix, Admix):
-                noise = torch.sum(noise, dim=0) / (self.m * self.n)
-            
-#             if not isinstance(self.admix, Dummy):
-#                 noise = torch.chunk(noise, self.m)
-#                 weights = self.gamma
-#                 weighted_noise = [g * w for g, w in zip(noise, weights)]
-#                 noise = torch.mean(torch.stack(weighted_noise), dim=0)
-#                 noise = torch.sum(torch.stack(torch.chunk(torch.Tensor(noise), self.n), dim=0), dim=0)
-            self.grad = noise + v
-            self.grad = self.tim.forward(self.grad)
+
+            self.grad = noise
             self.grad = self.grad / torch.mean(torch.abs(self.grad), dim=(1, 2, 3), keepdim=True)
-            if self.vt is not None:
-                # Why pass adv instead of adv_ or adv__?
-                # According to the formula, since the gradient used to update is from
-                # adv_, shouldn't use the adv_ as center of the neighborhood?
-                # Maybe that is why we perform admix and dim in vt
-                v_grad = self.vt.forward(adv_nes, model, labels_, target_labels_, self.device)
-                v = v_grad / self.N - noise
             adv = self.update(adv, idx)
-            adv = self.clip(adv, images)
-        return adv.detach(), model(adv).max(1)[1], self.n_iter 
+            adv = self.clip(adv, images).detach()
+        return adv.detach(), model(adv).max(1)[1], l.detach().item(), self.perturbation.detach(), self.n_iter 
 
     @abstractmethod
     def update(self, adv, idx):
         pass
 
     def clip(self, adv, images):
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
         delta = torch.clamp(adv - images, min=-self.ad_eps, max=self.ad_eps)
-        return (images + delta).detach()
+        self.perturbation = delta
+        adv_ = images + delta
+        adv_ = adv_ * std + mean        
+        adv_ = torch.clamp(adv_, 0, 1)
+        adv_ = (adv_ - mean) / std
+        return adv_
 
-class MI_FGSM(Attack):
-    def __init__(self, alpha=1, beta=1.0, eps=5, adjustment=None, n_iter=10, device="cuda",
+class Momentum(Attack):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda", 
+                beta=1.0,
+                activation="sign",
                 dim:DI=None, tim:TI=None, admix:Admix=None, vt:VT=None
                 ):
-        super().__init__(alpha, eps, adjustment, n_iter, device, dim, tim, admix, vt)
+        super().__init__(alpha, eps, adjustment, n_iter, device, activation, dim, tim, admix, vt)
         self.beta = beta
         self.momentum = None
-
-    def get_hp(self):
-        return {"beta":self.beta}
 
     def init_components(self, x):
         self.momentum = torch.zeros_like(x).to(self.device)
 
     def update(self, adv, idx):
-        self.grad = self.beta * self.momentum + self.grad
-        self.momentum = self.grad
-        return adv + self.ad_alpha * self.grad.sign()
+        g = self.beta * self.momentum + self.grad
+        self.momentum = g
+        return adv + self.ad_alpha * self.activation(g)
     
-class NI_FGSM(MI_FGSM):
-    def __init__(self, alpha=1, beta=1.0, eps=5, adjustment=None, n_iter=10, device="cuda", dim=None, tim=None, admix=None, vt=None) -> None:
-        super().__init__(alpha, beta, eps, adjustment, n_iter, device, dim, tim, admix, vt)
+class Nesterov(Momentum):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda", 
+                beta=1.0,
+                activation="sign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, beta, activation, dim, tim, admix, vt)
 
     def nesterov(self, adv, images):
-        adv_nes = adv + self.beta * self.ad_alpha * self.momentum.sign()
+        adv_nes = adv + self.beta * self.ad_alpha * self.activation(self.momentum)
         return self.clip(adv_nes, images)
     
-class AGI_FGSM(Attack):
-    def __init__(self, alpha=1, delta=1e-8, eps=5, adjustment=None, n_iter=10, device="cuda", dim=None, tim=None, admix=None, vt=None) -> None:
-        super().__init__(alpha, eps, adjustment, n_iter, device, dim, tim, admix, vt)
+class AdaGrad(Attack):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda", 
+                delta = 1e-8,
+                activation="softsign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, activation, dim, tim, admix, vt)
         self.delta = delta
-        self.momentum = None
-
-    def get_hp(self):
-        return {"delta":self.delta}
+        self.squared_grad = None
 
     def init_components(self, x):
-        self.momentum = torch.zeros_like(x).to(self.device)
+        self.squared_grad = torch.zeros_like(x).to(self.device)
 
     def update(self, adv, idx):
-        self.momentum = self.momentum + self.grad ** 2
-        return adv + self.ad_alpha * (self.grad / (torch.sqrt(self.momentum) + self.delta)).sign()
+        self.squared_grad = self.squared_grad + self.grad ** 2
+        g = self.grad / (torch.sqrt(self.squared_grad) + self.delta)
+        return adv + self.ad_alpha * self.activation(g)
     
-class RMSI_FGSM(Attack):
-    def __init__(self, alpha=1, beta=0.99, delta=1e-8, eps=5, adjustment=None, n_iter=10, device="cuda", dim=None, tim=None, admix=None, vt=None) -> None:
-        super().__init__(alpha, eps, adjustment, n_iter, device, dim, tim, admix, vt)
+class AdaDelta(AdaGrad):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda",
+                beta=0.9, delta=1e-6,
+                activation="softsign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, delta, activation, dim, tim, admix, vt)
         self.beta = beta
-        self.delta = delta
-        self.momentum = None
-
-    def get_hp(self):
-        return {"beta":self.beta, "delta":self.delta}
+        self.squared_x = None
 
     def init_components(self, x):
-        self.momentum = torch.zeros_like(x).to(self.device)
+        self.squared_grad = torch.zeros_like(x).to(self.device)
+        self.squared_x = torch.zeros_like(x).to(self.device)
 
     def update(self, adv, idx):
-        self.momentum = self.beta * self.momentum + (1 - self.beta) * self.grad ** 2
-        return adv + self.ad_alpha * (self.grad / (torch.sqrt(self.momentum) + self.delta)).sign()
+        self.squared_grad = self.beta * self.squared_grad + (1 - self.beta) * self.grad ** 2
+        delta_x = torch.sqrt((self.squared_x + self.delta) / (self.squared_grad + self.delta)) * self.grad
+        self.squared_x = self.beta * self.squared_x + (1 - self.beta) * delta_x ** 2
+        return adv + self.activation(delta_x)
     
-class AI_FGSM(Attack):
-    def __init__(self, alpha=1, beta_1=0.9, beta_2=0.999, delta=1e-8, eps=5, adjustment=None, n_iter=10, device="cuda", dim=None, tim=None, admix=None, vt=None) -> None:
-        super().__init__(alpha, eps, adjustment, n_iter, device, dim, tim, admix, vt)
+class RMSprop(AdaGrad):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda",
+                beta=0.99, delta=1e-8, 
+                activation="softsign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, delta, activation, dim, tim, admix, vt)
+        self.beta = beta
+
+    def update(self, adv, idx):
+        self.squared_grad = self.beta * self.squared_grad + (1 - self.beta) * self.grad ** 2
+        g = self.grad / (torch.sqrt(self.squared_grad) + self.delta)
+        return adv + self.ad_alpha * self.activation(g)
+    
+class Adam(Attack):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda",
+                beta_1=0.9, beta_2=0.999, delta=1e-8,
+                activation="softsign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, activation, dim, tim, admix, vt)
         self.beta_1 = beta_1
         self.beta_2 = beta_2
         self.delta = delta
-
-    def get_hp(self):
-        return {"beta_1":self.beta_1, "beta_2":self.beta_2, "delta":1e-8}
 
     def init_components(self, x):
         self.momentum_1 = torch.zeros_like(x).to(self.device)
@@ -334,11 +204,34 @@ class AI_FGSM(Attack):
         self.momentum_2 = self.beta_2 * self.momentum_2 + (1 - self.beta_2) * self.grad ** 2
         b_momentum_1 = self.momentum_1 / (1 - self.beta_1 ** (idx + 1))
         b_momentum_2 = self.momentum_2 / (1 - self.beta_2 ** (idx + 1))
-        return adv + self.ad_alpha * (b_momentum_1 / (torch.sqrt(b_momentum_2) + self.delta)).sign()
+        g = (b_momentum_1 / (torch.sqrt(b_momentum_2) + self.delta))
+        return adv + self.ad_alpha * self.activation(g)
 
-class NAI_FGSM(AI_FGSM):
-    def __init__(self, alpha=1, beta_1=0.9, beta_2=0.999, delta=1e-8, eps=5, adjustment=None, n_iter=10, device="cuda", dim=None, tim=None, admix=None, vt=None) -> None:
-        super().__init__(alpha, beta_1, beta_2, delta, eps, adjustment, n_iter, device, dim, tim, admix, vt)
+class AdaBelief(Adam):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda",
+                beta_1=0.9, beta_2=0.999, delta=1e-8,
+                activation="softsign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, beta_1, beta_2, delta, activation, dim, tim, admix, vt)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.delta = delta
+
+    def update(self, adv, idx):
+        self.momentum_1 = self.beta_1 * self.momentum_1 + (1 - self.beta_1) * self.grad
+        self.momentum_2 = self.beta_2 * self.momentum_2 + (1 - self.beta_2) * (self.grad - self.momentum_1) ** 2 + self.delta
+        b_momentum_1 = self.momentum_1 / (1 - self.beta_1 ** (idx + 1))
+        b_momentum_2 = self.momentum_2 / (1 - self.beta_2 ** (idx + 1))
+        g = (b_momentum_1 / (torch.sqrt(b_momentum_2) + self.delta))
+        adv = adv + self.ad_alpha * self.activation(g)
+        return adv
+
+class NAdam(Adam):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda",
+                beta_1=0.9, beta_2=0.999, delta=1e-8,
+                activation="softsign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, beta_1, beta_2, delta, activation, dim, tim, admix, vt)
         self.beta_1 = beta_1
         self.beta_2 = beta_2
         self.delta = delta
@@ -348,5 +241,105 @@ class NAI_FGSM(AI_FGSM):
         self.momentum_2 = self.beta_2 * self.momentum_2 + (1 - self.beta_2) * self.grad ** 2
         b_momentum_1 = self.momentum_1 / (1 - self.beta_1 ** (idx + 1))
         b_momentum_2 = self.momentum_2 / (1 - self.beta_2 ** (idx + 1))
-        adv = adv + self.ad_alpha * ((self.beta_1 * b_momentum_1 + (1 - self.beta_1) * self.grad / (1 - self.beta_1 ** (idx + 1))) / (torch.sqrt(b_momentum_2) + self.delta)).sign()        
+        g = (self.beta_1 * b_momentum_1 + (1 - self.beta_1) * self.grad / (1 - self.beta_1 ** (idx + 1))) / (torch.sqrt(b_momentum_2) + self.delta)
+        adv = adv + self.ad_alpha * self.activation(g)
         return adv
+    
+class Adan(Attack):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda",
+                beta_1=0.02, beta_2=0.08, beta_3=0.01, delta=1e-8, 
+                activation="softsign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, activation, dim, tim, admix, vt)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.beta_3 = beta_3
+        self.delta = delta
+        self.m_k, self.v_k, self.n_k = None, None, None
+        self.g_previous = None
+    
+    def init_components(self, x):
+        self.m_k = torch.zeros_like(x).to(self.device)
+        self.v_k = torch.zeros_like(x).to(self.device)
+        self.n_k = torch.zeros_like(x).to(self.device)
+        self.g_previous = torch.zeros_like(x).to(self.device)
+
+    def update(self, adv, idx):
+        bias_correction1 = 1.0 - math.pow(self.beta_1, idx + 1)
+        bias_correction2 = 1.0 - math.pow(self.beta_2, idx + 1)
+        bias_correction3_sq = math.sqrt(1.0 - math.pow(self.beta_3, idx + 1))
+        self.m_k = (1 - self.beta_1) * self.m_k + self.beta_1 * self.grad
+        self.v_k = (1 - self.beta_2) * self.v_k + self.beta_2 * (self.grad - self.g_previous)
+        self.n_k = (1 - self.beta_3) * self.n_k + self.beta_3 * (self.grad + (1 - self.beta_2) * (self.grad - self.g_previous)) ** 2
+        self.g_previous = self.grad.clone()
+        de_norm = self.n_k.sqrt().div_(bias_correction3_sq).add_(self.delta)
+        g1 = self.m_k / de_norm / bias_correction1
+        g2 = self.v_k * (1 - self.beta_2) / de_norm / bias_correction2
+
+        return adv + self.ad_alpha * self.activation(g1 + g2)
+    
+class Adai(Attack):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda",
+            beta_1=0.1, beta_2=0.99, dampening=1.0, delta=1e-3, 
+            activation="softsign",
+            dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, activation, dim, tim, admix, vt)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.dampening = dampening
+        self.delta = delta
+        self.exp_avg, self.exp_avg_sq, self.beta1_prod = None, None, None
+        self.param_size = None
+
+    def init_components(self, images):
+        self.exp_avg = torch.zeros_like(images)
+        self.exp_avg_sq = torch.zeros_like(images)
+        self.beta1_prod = torch.ones_like(images)
+        self.param_size = images.numel()
+
+    def update(self, adv, idx):
+        exp_avg_sq_hat_sum = 0.0
+        self.exp_avg_sq.mul_(self.beta_2).addcmul_(self.grad, self.grad, value=1.0 - self.beta_2)
+        bias_correction2 = 1 - self.beta_2 ** (idx + 1)
+        exp_avg_sq_hat_sum += self.exp_avg_sq.sum() / bias_correction2
+        exp_avg_sq_hat_mean = exp_avg_sq_hat_sum / self.param_size
+
+        exp_avg_sq_hat = self.exp_avg_sq / bias_correction2
+
+        beta1 = (
+            1.0
+            - (exp_avg_sq_hat / exp_avg_sq_hat_mean).pow_(1.0 / (3.0 - 2.0 * self.dampening)).mul_(self.beta_1)
+        ).clamp_(0.0, 1.0 - self.delta)
+        beta3 = (1.0 - beta1).pow_(self.dampening)
+
+        self.beta1_prod.mul_(beta1)
+
+        self.exp_avg.mul_(beta1).addcmul_(beta3, self.grad)
+        exp_avg_hat = self.exp_avg.div(1.0 - self.beta1_prod).mul_(math.pow(self.beta_1, 1. - self.dampening))
+
+        return adv + self.ad_alpha * self.activation(exp_avg_hat)
+
+class Yogi(Attack):
+    def __init__(self, alpha=1, eps=5, adjustment=None, n_iter=10, device="cuda",
+                beta_1=0.9, beta_2=0.999, initial_accumulator=1e-6, delta=1e-3, 
+                activation="softsign",
+                dim=None, tim=None, admix=None, vt=None) -> None:
+        super().__init__(alpha, eps, adjustment, n_iter, device, activation, dim, tim, admix, vt)
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.delta = delta
+        self.initial_accumulator = initial_accumulator
+        self.exp_avg, self.exp_avg_sq = None, None
+
+    def init_components(self, images):
+        self.exp_avg = torch.full_like(images, fill_value=self.initial_accumulator)
+        self.exp_avg_sq = torch.full_like(images, fill_value=self.initial_accumulator)
+
+
+    def update(self, adv, idx):
+        bias_correction2_sq = math.sqrt(1.0 - math.pow(self.beta_2, idx + 1))
+        grad_sq = self.grad * self.grad
+        self.exp_avg.mul_(self.beta_1).add_(self.grad, alpha=1.0 - self.beta_1)
+        self.exp_avg_sq.addcmul_((self.exp_avg_sq - grad_sq).sign_(), grad_sq, value=-(1.0 - self.beta_2))
+        de_nom = self.exp_avg_sq.sqrt().div_(bias_correction2_sq).add_(self.delta)
+        return adv + self.ad_alpha * self.activation(self.exp_avg / de_nom)
