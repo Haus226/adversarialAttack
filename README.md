@@ -1,15 +1,10 @@
 ### AdversarialAttack Repository Overview
 
-The repository implements several adversarial attack algorithms inspired by various optimization techniques commonly used in machine learning. These include:
+The repository implements several adversarial attack algorithms inspired by various optimization techniques commonly used in machine learning.
 
-- Momentum
-- Nesterov Accelerated Gradient (NAG)
-- Adagrad
-- Adadelta
-- RMSprop
-- Adam
-- NAdam
-- Adaptive Nesterov Momentum
+Reference: 
+[https://github.com/kozistr/pytorch_optimizer/tree/main](https://github.com/kozistr/pytorch_optimizer/tree/main)
+
 
 #### Types of Attacks
 
